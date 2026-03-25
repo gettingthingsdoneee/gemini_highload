@@ -249,4 +249,8 @@ RPS рассчитывается по формуле: RPS = (DAU × Действ
   11. https://developers.openai.com/api/docs/guides/prompt-engineering
   12. https://httparchive.org/reports/page-weight
   13. https://web.dev/fast/#optimize-your-images
+  14. Google AI – Gemini Embeddings. https://ai.google.dev/gemini/docs/embeddings
+  15. Google AI – File API. https://ai.google.dev/gemini-api/docs/file-api
+  16. Similarweb. AI Chatbot Usage Trends 2025. https://www.similarweb.com/blog/research/ai-chatbot-trends/
+  17. Google Developers – Search API. https://developers.google.com/search/docs
   
