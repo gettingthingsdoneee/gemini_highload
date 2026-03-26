@@ -488,23 +488,13 @@ erDiagram
         timestamptz created_at
     }
 
-    SYNC {
-        uuid session_token FK
-        bigint chat_id FK
-        bigint last_sync_message_id
-        timestamptz updated_at
-    }
-
     USERS ||--o{ SESSIONS : has
     USERS ||--o{ CHATS : owns
     CHATS ||--o{ MESSAGES : contains
     USERS ||--o{ MESSAGES : sends
     MESSAGES ||--o{ MEDIA : includes
-    SESSIONS ||--o{ SYNC : stores
-    CHATS ||--o{ SYNC : references
     EMBEDDINGS }o--|| MESSAGES : embeds
     EMBEDDINGS }o--|| MEDIA : embeds
-
 ```
 
 ## 5.2 Таблица с описанием таблиц
@@ -517,7 +507,12 @@ erDiagram
 | messages | Сообщения (запросы и ответы) | `message_id`(8) + `chat_id`(8) + `sender_id`(8) + `role`(1) + `content`(500) + `is_pinned`(1) + `is_deleted`(1) + `tokens_used`(8) + `created_at`(8) + `edited_at`(8) ≈ 553 Б | 287 млрд | 158 ПБ | 312 500 | 1 041 666 |
 | media | Медиафайлы (превью и метаданные) | `media_id`(16) + `chat_id`(8) + `message_id`(8) + `media_type`(1) + `file_uri`(256) + `size_bytes`(8) + `preview_uri`(256) + `storage`(1) + `expires_at`(8) + `created_at`(8) ≈ 570 Б + `preview_size` (200 КБ – 2 МБ) | 61,5 млрд | 12,3 ПБ (превью) + 35 ТБ (метаданные) | 114 600 | 143 200 |
 | embeddings | Векторные представления | `embedding_id`(16) + `source_id`(16) + `source_type`(1) + `embedding`(12 288 Б) + `created_at`(8) ≈ 12,3 КБ | 287 млрд | 3,5 ПБ | 1 300 000 (асинхронно) | 520 000 |
-| sync | Синхронизация сессий | `session_token`(16) + `chat_id`(8) + `last_sync_message_id`(8) + `updated_at`(8) ≈ 40 Б | 300 млн | 12 ГБ | 218 750 | 218 750 |
+
+### Требования к консистентности:
+
+Strict Consistency: users, sessions, chats, messages
+
+Eventual Consistency: media, embeddings
 
 
 
