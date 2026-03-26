@@ -409,6 +409,155 @@ RPS рассчитывается по формуле: RPS = (DAU × Действ
 
 Аналогичные расчёты выполняются для каждого дата‑центра пропорционально его нагрузке. Для DC5 (Азия) с 30 % трафика потребуется примерно 2 узла L4 и 5 узлов L7; для DC2/DC4 (Европа) – 2 узла L4 и 4 узла L7.
 
+---
+
+# 5. Логическая схема базы данных
+
+## 5.1 Схема БД
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        text username
+        text email
+        text phone
+        text home_region
+        jsonb settings
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    SESSIONS {
+        uuid token PK
+        bigint user_id FK
+        text device_info
+        inet ip_address
+        timestamptz expires_at
+        timestamptz created_at
+    }
+
+    CHATS {
+        bigint chat_id PK
+        bigint owner_id FK
+        text title
+        enum type "private"
+        jsonb metadata
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    MESSAGES {
+        bigint message_id PK
+        bigint chat_id FK
+        bigint sender_id FK
+        enum role "user", "assistant"
+        text content
+        boolean is_pinned
+        boolean is_deleted
+        bigint tokens_used
+        timestamptz created_at
+        timestamptz edited_at
+    }
+
+    MEDIA {
+        uuid media_id PK
+        bigint chat_id FK
+        bigint message_id FK
+        enum media_type "photo", "video", "audio"
+        text file_uri
+        bigint size_bytes
+        text preview_uri
+        enum storage "temporary", "permanent"
+        timestamptz expires_at
+        timestamptz created_at
+    }
+
+    EMBEDDINGS {
+        uuid embedding_id PK
+        uuid source_id
+        enum source_type "message", "media"
+        vector embedding
+        timestamptz created_at
+    }
+
+    SYNC {
+        uuid session_token FK
+        bigint chat_id FK
+        bigint last_sync_message_id
+        timestamptz updated_at
+    }
+
+    USERS ||--o{ SESSIONS : has
+    USERS ||--o{ CHATS : owns
+    CHATS ||--o{ MESSAGES : contains
+    USERS ||--o{ MESSAGES : sends
+    MESSAGES ||--o{ MEDIA : includes
+    SESSIONS ||--o{ SYNC : stores
+    CHATS ||--o{ SYNC : references
+    EMBEDDINGS }o--|| MESSAGES : embeds
+    EMBEDDINGS }o--|| MEDIA : embeds
+```
+
+## 5.2 Таблица с описанием таблиц
+
+| Таблица | Описание | Размер строки | Количество строк | Размер таблицы | Нагрузка на запись (QPS, пик) | Нагрузка на чтение (QPS, пик) |
+|---------|----------|----------------|------------------|----------------|------------------------------|------------------------------|
+| users | Профили пользователей | `user_id`(8) + `username`(32) + `email`(64) + `phone`(20) + `home_region`(10) + `settings`(512) + `created_at`(8) + `updated_at`(8) ≈ 662 Б | 750 млн | 496 ГБ | 5 800 | 86 800 |
+| sessions | Активные сессии | `token`(16) + `user_id`(8) + `device_info`(100) + `ip_address`(16) + `expires_at`(8) + `created_at`(8) ≈ 156 Б | 150 млн | 23,4 ГБ | 8 600 | 210 000 |
+| chats | Личные диалоги | `chat_id`(8) + `owner_id`(8) + `title`(64) + `type`(1) + `metadata`(256) + `created_at`(8) + `updated_at`(8) ≈ 353 Б | 15 млрд | 5,3 ТБ | 15 000 | 175 000 |
+| messages | Сообщения (запросы и ответы) | `message_id`(8) + `chat_id`(8) + `sender_id`(8) + `role`(1) + `content`(500) + `is_pinned`(1) + `is_deleted`(1) + `tokens_used`(8) + `created_at`(8) + `edited_at`(8) ≈ 553 Б | 287 млрд | 158 ПБ | 312 500 | 1 041 666 |
+| media | Медиафайлы (превью и метаданные) | `media_id`(16) + `chat_id`(8) + `message_id`(8) + `media_type`(1) + `file_uri`(256) + `size_bytes`(8) + `preview_uri`(256) + `storage`(1) + `expires_at`(8) + `created_at`(8) ≈ 570 Б + `preview_size` (200 КБ – 2 МБ) | 61,5 млрд | 12,3 ПБ (превью) + 35 ТБ (метаданные) | 114 600 | 143 200 |
+| embeddings | Векторные представления | `embedding_id`(16) + `source_id`(16) + `source_type`(1) + `embedding`(12 288 Б) + `created_at`(8) ≈ 12,3 КБ | 287 млрд | 3,5 ПБ | 1 300 000 (асинхронно) | 520 000 |
+| sync | Синхронизация сессий | `session_token`(16) + `chat_id`(8) + `last_sync_message_id`(8) + `updated_at`(8) ≈ 40 Б | 300 млн | 12 ГБ | 218 750 | 218 750 |
+
+## 5.3 Требования к консистентности
+
+| Таблица | Требование | Обоснование |
+|---------|------------|-------------|
+| users | Strict Consistency | Изменения профиля, настроек, привязки к ДЦ должны быть видны сразу; недопустимы потери. |
+| sessions | Strict Consistency | Сессии критичны для аутентификации; рассинхронизация токенов недопустима. |
+| chats | Strict Consistency | Названия диалогов и метаданные должны быть консистентны. |
+| messages | Strict Consistency | Порядок сообщений важен для контекста диалога; запрещены пропуски или дубликаты. |
+| media | Eventual Consistency | Превью медиа могут появляться с небольшой задержкой; исходные файлы временные. |
+| embeddings | Eventual Consistency | Векторы формируются асинхронно; поиск допускает незначительную задержку. |
+| sync | Strict Consistency | Позиция синхронизации должна быть точной, чтобы не пропускать сообщения. |
+
+
+## 5.4 Особенности распределения нагрузки по ключам
+
+| Таблица | Ключ шардирования | Обоснование |
+|---------|-------------------|-------------|
+| users | `user_id` | Все данные пользователя в одном шарде, упрощает управление. |
+| sessions | `user_id` | Сессии одного пользователя в одном шарде для быстрой проверки токена. |
+| chats | `user_id` (владелец) | Все диалоги пользователя в одном шарде для быстрой загрузки списка. |
+| messages | `chat_id` (хеш) | Все сообщения диалога в одном шарде, что ускоряет загрузку истории. |
+| media | `chat_id` | Медиа привязаны к сообщениям, размещаются в том же шарде. |
+| embeddings | `source_id` (хеш) | Равномерное распределение векторов по кластеру. |
+| sync | `session_token` | Записи синхронизации распределяются по токенам, балансируя нагрузку. |
+
+Нагрузочные профили:
+- Запись сообщений (messages) – самый высокий пиковый QPS (312 500), распределяется по шардам равномерно благодаря хешированию по `chat_id`.
+- Чтение сообщений (загрузка диалогов) – ещё выше (1 041 666 QPS), хорошо кэшируется на клиенте и CDN.
+- Запись и чтение эмбеддингов – асинхронные фоновые процессы, пиковые QPS (1 300 000 запись, 520 000 чтение) обрабатываются в очередях.
+
+Обеспечение консистентности при шардировании:
+- Для транзакций, затрагивающих несколько шардов (например, создание диалога и первое сообщение), используется двухфазный коммит или компенсирующие операции.
+- Для повышения доступности применяется синхронная репликация лидера для строгих таблиц (users, sessions, chats, messages, sync) и асинхронная – для eventual‑consistent таблиц (media, embeddings).
+
+## 5.5 Оценка объёмов хранения и нагрузки
+
+| Показатель | Значение |
+|------------|----------|
+| Общее количество сообщений за 18 месяцев | 287 млрд |
+| Общее количество медиа (превью) за 18 месяцев | 61,5 млрд |
+| Общее количество эмбеддингов | 287 млрд |
+| Общий объём постоянного хранения | ~570 ПБ (с учётом сжатых медиа, эмбеддингов, TTS) |
+| Пиковая нагрузка на запись (messages) | 312 500 QPS |
+| Пиковая нагрузка на чтение (messages) | 1 041 666 QPS |
+| Пиковая нагрузка на запись эмбеддингов (асинхронно) | 1 300 000 QPS |
+| Пиковая нагрузка на чтение эмбеддингов | 520 000 QPS |
+
 
 ##  Список источников
 
