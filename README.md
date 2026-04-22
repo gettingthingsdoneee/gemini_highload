@@ -515,6 +515,230 @@ Strict Consistency: users, sessions, chats, messages
 Eventual Consistency: media, embeddings
 
 
+# 6. Физическая схема базы данных
+
+## 6.1. Физическая схема базы данных
+
+```mermaid
+erDiagram
+    USERS {
+        bigint user_id PK
+        text username UK
+        text email UK
+        text phone UK
+        text home_region
+        jsonb settings
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    CHATS {
+        bigint chat_id PK
+        bigint owner_id FK
+        text title
+        text type
+        jsonb metadata
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    USER_INBOX {
+        bigint user_id PK
+        bigint chat_id PK
+        bigint last_message_id
+        text last_message_preview
+        int unread_count
+        timestamptz updated_at
+    }
+
+    MEDIA_METADATA {
+        uuid media_id PK
+        bigint chat_id
+        bigint message_id
+        smallint media_type
+        text file_uri
+        text preview_uri
+        text storage
+        bigint size_bytes
+        timestamptz expires_at
+        timestamptz created_at
+    }
+
+    MESSAGES {
+        bigint chat_id PK
+        bigint message_id PK
+        bigint sender_id
+        text role
+        text content
+        text cot_content
+        boolean is_pinned
+        boolean is_deleted
+        bigint tokens_used
+        timestamptz created_at
+        timestamptz edited_at
+    }
+
+    EMBEDDINGS {
+        uuid embedding_id PK
+        uuid source_id
+        text source_type
+        vector embedding
+        timestamptz created_at
+    }
+
+    SESSIONS {
+        string token PK
+        bigint user_id
+        string device_info
+        timestamptz expires_at
+    }
+
+    WS_MAPPING {
+        bigint user_id
+        string socket_id
+    }
+
+    MEDIA_FILES {
+        string key PK
+        bytes content
+        string content_type
+        bigint size
+    }
+
+    USERS ||--o{ CHATS : owns
+    USERS ||--o{ USER_INBOX : has
+    CHATS ||--o{ USER_INBOX : aggregates
+    CHATS ||--o{ MESSAGES : contains
+    USERS ||--o{ MESSAGES : sends
+    MESSAGES ||--o{ MEDIA_METADATA : includes
+    MESSAGES ||--o{ EMBEDDINGS : generates
+    MEDIA_METADATA ||--|| MEDIA_FILES : stores
+    USERS ||--o{ SESSIONS : has
+    USERS ||--o{ WS_MAPPING : maintains
+```
+
+### Описание таблиц с денормализаций
+
+| Таблица | Назначение | Ключ шардирования | СУБД |
+| :--- | :--- | :--- | :--- |
+| users | Профили пользователей | `user_id` | PostgreSQL |
+| sessions | Активные сессии | `token`  | Redis |
+| chats | Метаданные диалогов | `user_id` | PostgreSQL |
+| messages | Тексты сообщений  | `chat_id` | ScyllaDB |
+| user_inbox | Денормализованная лента событий пользователя (для быстрой загрузки списка диалогов) | `user_id` | PostgreSQL |
+| media_metadata | Метаданные медиафайлов (превью, ссылки) | `chat_id` | PostgreSQL |
+| embeddings | Векторные представления сообщений | `message_id` | pgvector / Qdrant |
+| media_files | Бинарные данные медиа | `bucket/key` | Ceph RGW (S3) |
+
+## 6.2. Выбор СУБД и хранилищ
+
+| Компонент данных | СУБД / Хранилище | Обоснование выбора |
+| :--- | :--- | :--- |
+| users, chats, user_inbox, media_metadata | PostgreSQL** | ACID-транзакции, строгая консистентность |
+| messages | ScyllaDB | Высокая нагрузка на запись (312,5k QPS пик) и чтение (1M+ QPS пик). ScyllaDB обеспечивает горизонтальное масштабирование записи и хранение десятков триллионов строк с низкой задержкой. Партиционирование по `chat_id` локализует историю чата на одном узле |
+| embeddings | pgvector | Для семантического поиска по истории и контексту модели |
+| sessions, ws_mapping | Redis Cluster | Требования к сверхнизкой задержке  для проверки аутентификации и маршрутизации WebSocket-сообщений. Встроенная поддержка TTL автоматически удаляет истекшие сессии. |
+| media_files (бинарные данные) | Ceph RGW (S3 Compatible) | Объектное хранилище оптимально для неструктурированных данных (изображения, видео). Обеспечивает георепликацию, высокую доступность |
+
+## 6.3. Индексы и денормализация
+
+### Денормализация:
+
+1.  `user_inbox`:
+    - Введена таблица `user_inbox` (чтобы избежать JOIN таблиц `chats`, `messages` и `media` при загрузке списка диалогов), куда асинхронно через Kafka пишется событие о каждом новом сообщении для каждого участника чата. Содержит поля: `user_id`, `chat_id`, `last_message_preview`, `updated_at`.
+
+2.  `CoT` (рассуждения):
+    - В таблице `messages` появилось поле `cot_content` для хранения цепочки рассуждений, чтобы не смешивать служебные данные модели с текстом ответа пользователю при отображении.
+
+### Индексы:
+
+| Таблица | Поля индекса | Тип | Обоснование |
+| :--- | :--- | :--- | :--- |
+| users | `email`, `phone` | UNIQUE B-Tree | Поиск при логине. |
+| user_inbox | `(user_id, updated_at DESC)` | Composite B-Tree | Критически важный индекс для главного экрана. Покрывающий (include `last_message_preview`) для исключения обращений к данным таблицы. |
+| media_metadata | `(chat_id, message_id)` | B-Tree | Быстрый поиск превью, прикрепленных к конкретному сообщению в чате. |
+| messages | `(chat_id)`, `message_id` | Partition Key + Clustering Key DESC | Позволяет эффективно выбирать последние N сообщений в чате (`LIMIT 50`). |
+| embeddings | `embedding` | IVF_FLAT / HNSW | Индекс для приближенного поиска ближайших соседей (ANN) по косинусному расстоянию. |
+
+## 6.4. Шардирование и резервирование
+
+| Компонент | Стратегия шардирования / партиционирования | Схема резервирования |
+| :--- | :--- | :--- |
+| PostgreSQL | Шардирование по `user_id` с использованием Citus или ручного прокси. Данные пользователя и его чаты локализованы на одном шарде. | Master-Replica (1 Master + 2 Replica). Запись в мастер, чтение с реплик. Автоматический failover через Patroni + etcd. |
+| ScyllaDB | Partition Key = `chat_id`. Каждый чат целиком лежит на одном наборе узлов (vnodes). | Replication Factor = 3 (данные хранятся на трех узлах в разных стойках). Уровень консистентности: `QUORUM` для записи/чтения гарантирует актуальность данных. |
+| Redis | Redis Cluster с 16384 хеш-слотами. Ключи распределены по слотам равномерно (например, `session:{token}`). | Master-Slave. Каждый мастер имеет минимум одного реплицирующего слейва. При падении мастера слейв автоматически повышается оркестратором кластера. |
+| Ceph RGW | Шардирование на уровне бакетов: `bucket = user_id % N` или `chat_id`. | Георепликация (Multi-Site). Данные реплицируются между регионами (например, Америка -> Европа) для катастрофоустойчивости и ускорения доступа. |
+
+## 6.5. Клиентские библиотеки и балансировка подключений
+
+| СУБД | Библиотека | Балансировщик / Прокси | Описание |
+| :--- | :--- | :--- | :--- |
+| PostgreSQL | `jackc/pgx` | PgBouncer | Пул соединений в режиме Transaction Pooling. Запросы на чтение автоматически направляются на реплики через `pgx` с поддержкой `read-write splitting`. |
+| ScyllaDB | `gocql` | Встроенный Token-Aware Policy | Драйвер сам вычисляет узел-владелец партиции `chat_id` и отправляет запрос напрямую, минуя прокси. |
+| Redis | `go-redis` | Встроенный Cluster Client | Клиент кэширует карту слотов и направляет команды на нужный мастер без промежуточных прокси. |
+| Ceph RGW | `minio-go` | Envoy / NGINX | Для раздачи статики медиа используется NGINX reverse proxy с кэшированием. Внутренние сервисы ходят напрямую в S3 API. |
+
+## 6.6. Схема резервного копирования
+
+| Хранилище | Метод бэкапа | Периодичность / RPO | Комментарий |
+| :--- | :--- | :--- | :--- |
+| PostgreSQL** | `pg_basebackup` + WAL Archiving | Полный бэкап раз в сутки, WAL непрерывно. | Point-in-Time Recovery (PITR). Возможность восстановления с точностью до секунды на случай логической ошибки (например, дроп таблицы). |
+| ScyllaDB | Snapshot (`nodetool snapshot`) | Раз в 6 часов. | Снапшоты загружаются в холодное объектное хранилище (AWS S3 Glacier). RPO = 6 часов. |
+| Redis | RDB + AOF | RDB каждые 30 мин, AOF каждую секунду. | AOF обеспечивает минимальную потерю сессий (RPO ~1 сек). Данные сессий критичны для UX, но не для долгосрочного хранения. |
+| Ceph RGW | Версионирование бакетов + репликация | Непрерывно. | Георепликация защищает от потери ДЦ. Версионирование защищает от случайного удаления файла пользователем (soft delete). |
+
+# 7. Алгоритмы
+
+## 7.1. Алгоритм потоковой обработки мультимодальных сообщений (Ingest & Fan-out)
+
+- Блок системы: Backend API Gateway / Message Processor.
+- Постановка задачи: Пользователь отправляет сообщение, которое может содержать текст, изображение, аудио или видео. Система должна:
+    1.  Временно сохранить бинарные файлы (до 48 ч).
+    2.  Обеспечить распознавание речи (ASR) для голосовых сообщений.
+    3.  Передать контент LLM (с превью для медиа).
+    4.  Сохранить результат в истории и синхронизировать его на всех устройствах пользователя с минимальной задержкой.
+- Исходные данные: `user_id`, `chat_id`, `text_content`, `media_files[]`.
+- Алгоритм (асинхронный пайплайн):
+    1.  Ingest: Клиент загружает медиа на `media.gemini.google.com`. Сервер возвращает `media_id`.
+    2.  Pre-Processing: Отправка задания в Kafka (`topic: raw-user-media`).
+        - ASR Worker: Читает аудио, вызывает Google Speech-to-Text API, результат кладет в `topic: user-messages`.
+        - Media Transcoder: Создает превью (WebP 200KB / VP9 2MB), сохраняет в Ceph RGW. Метаданные сохраняет в PostgreSQL.
+    3.  Model Inference: Запрос с текстом и ссылками на превью отправляется в Gemini Model Serving.
+    4.  Fan-out (Write Path):
+        - Ответ модели (текст + CoT + голос от TTS) пишется в ScyllaDB (`table: messages`).
+        - Inbox Worker генерирует событие в таблицу `user_inbox` (PostgreSQL) для каждого участника чата.
+        - Notifier проверяет Redis Set `ws:{user_id}` и рассылает обновление по WebSocket активным клиентам.
+- Обоснование: Использование Transactional Outbox через Kafka гарантирует, что сообщение не потеряется при сбоях записи в БД. Асинхронная обработка медиа разгружает синхронный API запросов, удерживая время ответа в пределах SLA.
+- Влияние на схему БД: Требует введения таблицы `user_inbox` (денормализация) для быстрой синхронизации клиентов.
+
+## 7.2. Алгоритм управления контекстом диалога и кэшированием KV-кэша LLM
+
+- Блок системы: Inference Engine / Model Serving.
+- Постановка задачи: LLM тратит до 30% времени инференса на повторное вычисление KV-кэша для истории диалога. При 75 млн DAU и длинных сессиях (6+ сообщений) необходимо минимизировать вычислительные затраты и задержку.
+- Алгоритм: Prefix Caching с детерминированным хешированием.
+    1.  Вычисление хеша префикса: Для каждого чата последние `N` сообщений (история) сериализуются и хешируются (MD5).
+    2.  Поиск в распределенном кэше: Ключ `prefix_cache:{model_version}:{hash}` ищется в Redis (или colocated DRAM на GPU-нодах).
+    3.  Ветвление:
+        - Cache Hit: KV-кэш загружается в память GPU, вычисляется только новый токен (экономия до 70% FLOPs).
+        - Cache Miss: Полный пересчет истории (prefill) с сохранением результата в кэш.
+    4.  TTL: Время жизни кэша ограничено 10 минутами (типичное время паузы в диалоге) для экономии памяти.
+- Альтернативы: Отсутствие кэширования (удорожает инференс), хранение полного контекста в БД для каждого запроса (увеличивает сетевой трафик).
+- Влияние на архитектуру: Требует наличия высокоскоростного разделяемого хранилища KV-кэша (Redis on RDMA) в кластере инференса. Снижает пиковую нагрузку на GPU и позволяет обслуживать больше пользователей на единицу оборудования.
+
+
+# 8. Технологии
+
+| Технология | Область применения в системе Gemini | Обоснование |
+| :--- | :--- | :--- |
+| TypeScript + React | Веб-клиент (Web App) | Строгая типизация для сложной логики отображения мультимодального контента (Markdown, изображения, аудиоплеер). Виртуальный DOM React оптимален для динамического обновления потока сообщений. |
+| Kotlin / Swift | Мобильные клиенты (Android / iOS) | Нативная производительность для работы с микрофоном (ASR), камерой и локальной базой данных истории сообщений (Offline-First). |
+| Golang | Backend Core Services (API Gateway, History, Media Proxy) | Низкое потребление памяти, отличная работа с конкурентностью (горутины), что критично для поддержания миллионов долгоживущих WebSocket-соединений. |
+| Python (FastAPI / Ray) | Model Serving Wrapper / Orchestrator | Стандарт де-факто в ML-инженерии. Позволяет использовать нативные биндинги для JAX и PyTorch без накладных расходов на сериализацию в другие языки. |
+| Envoy Proxy | Service Mesh / Edge Proxy | Расширенная поддержка gRPC-Web (для стриминга ответов модели в браузер), продвинутая балансировка нагрузки и автоматический Retry/Timeout. |
+| Apache Kafka** | Шина асинхронных событий | Гарантированная доставка событий при пиковой нагрузке в 1.3M QPS. Декуплинг API запроса от тяжелой обработки (ASR, генерация эмбеддингов). |
+| Kubernetes (GKE)** | Оркестрация контейнеров | Автоматическое масштабирование (HPA) по метрикам RPS и длине очереди в Kafka. Эффективная упаковка бинов в Google Cloud. |
+| ScyllaDB** | Основное хранилище истории сообщений | Уникальная архитектура на C++ (Seastar) позволяет утилизировать 100% ресурсов NVMe дисков и 100GbE сети, обрабатывая миллионы IOPS на узел. |
+| Ceph RGW | Объектное хранилище медиафайлов | S3-совместимый API, позволяющий легко интегрироваться с CDN и мобильными SDK. Экономическая эффективность хранения эксабайт данных по сравнению с блочными томами Compute Engine. |
 
 
 
