@@ -460,8 +460,6 @@ erDiagram
         bigint sender_id FK
         text role
         text content
-        boolean is_pinned
-        boolean is_deleted
         bigint tokens_used
         timestamptz created_at
         timestamptz edited_at
@@ -571,8 +569,6 @@ erDiagram
         text role
         text content
         text cot_content
-        boolean is_pinned
-        boolean is_deleted
         bigint tokens_used
         timestamptz created_at
         timestamptz edited_at
@@ -590,7 +586,6 @@ erDiagram
         string token PK
         bigint user_id
         string device_info
-        timestamptz expires_at
     }
 
     WS_MAPPING {
@@ -637,7 +632,7 @@ erDiagram
 | users, chats, user_inbox, media_metadata | PostgreSQL** | ACID-транзакции, строгая консистентность |
 | messages | ScyllaDB | Высокая нагрузка на запись (312,5k QPS пик) и чтение (1M+ QPS пик). ScyllaDB обеспечивает горизонтальное масштабирование записи и хранение десятков триллионов строк с низкой задержкой. Партиционирование по `chat_id` локализует историю чата на одном узле |
 | embeddings | pgvector | Для семантического поиска по истории и контексту модели |
-| sessions, ws_mapping | Redis Cluster | Требования к сверхнизкой задержке  для проверки аутентификации и маршрутизации WebSocket-сообщений. Встроенная поддержка TTL автоматически удаляет истекшие сессии. |
+| sessions, ws_mapping | Redis | Требования к сверхнизкой задержке  для проверки аутентификации и маршрутизации WebSocket-сообщений. Встроенная поддержка TTL автоматически удаляет истекшие сессии. |
 | media_files (бинарные данные) | Ceph RGW (S3 Compatible) | Объектное хранилище оптимально для неструктурированных данных (изображения, видео). Обеспечивает георепликацию, высокую доступность |
 
 ## 6.3. Индексы и денормализация
@@ -682,7 +677,7 @@ erDiagram
 
 | Хранилище | Метод бэкапа | Периодичность / RPO | Комментарий |
 | :--- | :--- | :--- | :--- |
-| PostgreSQL** | `pg_basebackup` + WAL Archiving | Полный бэкап раз в сутки, WAL непрерывно. | Point-in-Time Recovery (PITR). Возможность восстановления с точностью до секунды на случай логической ошибки (например, дроп таблицы). |
+| PostgreSQL | `pg_basebackup` + WAL Archiving | Полный бэкап раз в сутки, WAL непрерывно. | Point-in-Time Recovery (PITR). Возможность восстановления с точностью до секунды на случай логической ошибки (например, дроп таблицы). |
 | ScyllaDB | Snapshot (`nodetool snapshot`) | Раз в 6 часов. | Снапшоты загружаются в холодное объектное хранилище (AWS S3 Glacier). RPO = 6 часов. |
 | Redis | RDB + AOF | RDB каждые 30 мин, AOF каждую секунду. | AOF обеспечивает минимальную потерю сессий (RPO ~1 сек). Данные сессий критичны для UX, но не для долгосрочного хранения. |
 | Ceph RGW | Версионирование бакетов + репликация | Непрерывно. | Георепликация защищает от потери ДЦ. Версионирование защищает от случайного удаления файла пользователем (soft delete). |
