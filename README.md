@@ -448,7 +448,6 @@ erDiagram
         bigint chat_id PK
         bigint owner_id FK
         text title
-        text type
         jsonb metadata
         timestamptz created_at
         timestamptz updated_at
@@ -460,6 +459,7 @@ erDiagram
         bigint sender_id FK
         text role
         text content
+        text cot_content
         bigint tokens_used
         timestamptz created_at
         timestamptz edited_at
@@ -471,9 +471,6 @@ erDiagram
         bigint message_id FK
         text media_type
         text file_uri
-        bigint size_bytes
-        text preview_uri
-        text storage
         timestamptz expires_at
         timestamptz created_at
     }
@@ -501,9 +498,9 @@ erDiagram
 |---------|----------|----------------|------------------|----------------|------------------------------|------------------------------|
 | users | Профили пользователей | `user_id`(8) + `username`(32) + `email`(64) + `phone`(20) + `home_region`(10) + `settings`(512) + `created_at`(8) + `updated_at`(8) ≈ 662 Б | 750 млн | 496 ГБ | 5 800 | 86 800 |
 | sessions | Активные сессии | `token`(16) + `user_id`(8) + `device_info`(100) + `ip_address`(16) + `expires_at`(8) + `created_at`(8) ≈ 156 Б | 150 млн | 23,4 ГБ | 8 600 | 210 000 |
-| chats | Личные диалоги | `chat_id`(8) + `owner_id`(8) + `title`(64) + `type`(1) + `metadata`(256) + `created_at`(8) + `updated_at`(8) ≈ 353 Б | 15 млрд | 5,3 ТБ | 15 000 | 175 000 |
-| messages | Сообщения (запросы и ответы) | `message_id`(8) + `chat_id`(8) + `sender_id`(8) + `role`(1) + `content`(500) + `is_pinned`(1) + `is_deleted`(1) + `tokens_used`(8) + `created_at`(8) + `edited_at`(8) ≈ 553 Б | 287 млрд | 158 ПБ | 312 500 | 1 041 666 |
-| media | Медиафайлы (превью и метаданные) | `media_id`(16) + `chat_id`(8) + `message_id`(8) + `media_type`(1) + `file_uri`(256) + `size_bytes`(8) + `preview_uri`(256) + `storage`(1) + `expires_at`(8) + `created_at`(8) ≈ 570 Б + `preview_size` (200 КБ – 2 МБ) | 61,5 млрд | 12,3 ПБ (превью) + 35 ТБ (метаданные) | 114 600 | 143 200 |
+| chats | Личные диалоги | `chat_id`(8) + `owner_id`(8) + `title`(64)  + `metadata`(256) + `created_at`(8) + `updated_at`(8) ≈ 353 Б | 15 млрд | 5,3 ТБ | 15 000 | 175 000 |
+| messages | Сообщения (запросы и ответы) | `message_id`(8) + `chat_id`(8) + `sender_id`(8) + `role`(1) + `content`(500) + `cot_content`(650) `tokens_used`(8) + `created_at`(8) + `edited_at`(8) ≈ 553 Б | 287 млрд | 158 ПБ | 312 500 | 1 041 666 |
+| media | Медиафайлы (превью и метаданные) | `media_id`(16) + `chat_id`(8) + `message_id`(8) + `media_type`(1) + `file_uri`(256)  + `expires_at`(8) + `created_at`(8) ≈ 570 Б | 61,5 млрд | 12,3 ПБ (превью) + 35 ТБ (метаданные) | 114 600 | 143 200 |
 | embeddings | Векторные представления | `embedding_id`(16) + `source_id`(16) + `source_type`(1) + `embedding`(12 288 Б) + `created_at`(8) ≈ 12,3 КБ | 287 млрд | 3,5 ПБ | 1 300 000 (асинхронно) | 520 000 |
 
 ### Требования к консистентности:
@@ -534,18 +531,8 @@ erDiagram
         bigint chat_id PK
         bigint owner_id FK
         text title
-        text type
         jsonb metadata
         timestamptz created_at
-        timestamptz updated_at
-    }
-
-    USER_INBOX {
-        bigint user_id PK
-        bigint chat_id PK
-        bigint last_message_id
-        text last_message_preview
-        int unread_count
         timestamptz updated_at
     }
 
@@ -554,17 +541,14 @@ erDiagram
         bigint chat_id
         bigint message_id
         smallint media_type
-        text file_uri
-        text preview_uri
-        text storage
-        bigint size_bytes
+        varchar file_key
         timestamptz expires_at
         timestamptz created_at
     }
 
     MESSAGES {
         bigint chat_id PK
-        bigint message_id PK
+        bigint message_id FK
         bigint sender_id
         text role
         text content
@@ -588,11 +572,6 @@ erDiagram
         string device_info
     }
 
-    WS_MAPPING {
-        bigint user_id
-        string socket_id
-    }
-
     MEDIA_FILES {
         string key PK
         bytes content
@@ -601,15 +580,14 @@ erDiagram
     }
 
     USERS ||--o{ CHATS : owns
-    USERS ||--o{ USER_INBOX : has
-    CHATS ||--o{ USER_INBOX : aggregates
     CHATS ||--o{ MESSAGES : contains
     USERS ||--o{ MESSAGES : sends
     MESSAGES ||--o{ MEDIA_METADATA : includes
-    MESSAGES ||--o{ EMBEDDINGS : generates
     MEDIA_METADATA ||--|| MEDIA_FILES : stores
     USERS ||--o{ SESSIONS : has
-    USERS ||--o{ WS_MAPPING : maintains
+    EMBEDDINGS }o--|| MESSAGES : embeds
+    EMBEDDINGS }o--|| MEDIA_METADATA : embeds
+
 ```
 
 ### Описание таблиц с денормализаций
@@ -620,37 +598,25 @@ erDiagram
 | sessions | Активные сессии | `token`  | Redis |
 | chats | Метаданные диалогов | `user_id` | PostgreSQL |
 | messages | Тексты сообщений  | `chat_id` | ScyllaDB |
-| user_inbox | Денормализованная лента событий пользователя (для быстрой загрузки списка диалогов) | `user_id` | PostgreSQL |
-| media_metadata | Метаданные медиафайлов (превью, ссылки) | `chat_id` | PostgreSQL |
-| embeddings | Векторные представления сообщений | `message_id` | pgvector / Qdrant |
-| media_files | Бинарные данные медиа | `bucket/key` | Ceph RGW (S3) |
+| media_metadata | Метаданные медиафайлов | `chat_id` | PostgreSQL |
+| embeddings | Векторные представления сообщений | `message_id` | pgvector |
+| media_files | Бинарные данные медиа | `key` | Ceph RGW  |
 
 ## 6.2. Выбор СУБД и хранилищ
 
 | Компонент данных | СУБД / Хранилище | Обоснование выбора |
 | :--- | :--- | :--- |
-| users, chats, user_inbox, media_metadata | PostgreSQL** | ACID-транзакции, строгая консистентность |
-| messages | ScyllaDB | Высокая нагрузка на запись (312,5k QPS пик) и чтение (1M+ QPS пик). ScyllaDB обеспечивает горизонтальное масштабирование записи и хранение десятков триллионов строк с низкой задержкой. Партиционирование по `chat_id` локализует историю чата на одном узле |
+| users, chats, media_metadata | PostgreSQL | ACID-транзакции, строгая консистентность |
+| messages | ScyllaDB | Высокие RPS записи/чтения, партиционирование по chat_id |
 | embeddings | pgvector | Для семантического поиска по истории и контексту модели |
-| sessions, ws_mapping | Redis | Требования к сверхнизкой задержке  для проверки аутентификации и маршрутизации WebSocket-сообщений. Встроенная поддержка TTL автоматически удаляет истекшие сессии. |
-| media_files (бинарные данные) | Ceph RGW (S3 Compatible) | Объектное хранилище оптимально для неструктурированных данных (изображения, видео). Обеспечивает георепликацию, высокую доступность |
+| sessions | Redis | Низкая задержка, TTL для сессий |
+| media_files | Ceph RGW | Хранение содержимого файлов (фото, видео) в объектном хранилище |
 
-## 6.3. Индексы и денормализация
-
-### Денормализация:
-
-1.  `user_inbox`:
-    - Введена таблица `user_inbox` (чтобы избежать JOIN таблиц `chats`, `messages` и `media` при загрузке списка диалогов), куда асинхронно через Kafka пишется событие о каждом новом сообщении для каждого участника чата. Содержит поля: `user_id`, `chat_id`, `last_message_preview`, `updated_at`.
-
-2.  `CoT` (рассуждения):
-    - В таблице `messages` появилось поле `cot_content` для хранения цепочки рассуждений, чтобы не смешивать служебные данные модели с текстом ответа пользователю при отображении.
-
-### Индексы:
+## 6.3. Индексы
 
 | Таблица | Поля индекса | Тип | Обоснование |
 | :--- | :--- | :--- | :--- |
 | users | `email`, `phone` | UNIQUE B-Tree | Поиск при логине. |
-| user_inbox | `(user_id, updated_at DESC)` | Composite B-Tree | Критически важный индекс для главного экрана. Покрывающий (include `last_message_preview`) для исключения обращений к данным таблицы. |
 | media_metadata | `(chat_id, message_id)` | B-Tree | Быстрый поиск превью, прикрепленных к конкретному сообщению в чате. |
 | messages | `(chat_id)`, `message_id` | Partition Key + Clustering Key DESC | Позволяет эффективно выбирать последние N сообщений в чате (`LIMIT 50`). |
 | embeddings | `embedding` | IVF_FLAT / HNSW | Индекс для приближенного поиска ближайших соседей (ANN) по косинусному расстоянию. |
@@ -668,10 +634,10 @@ erDiagram
 
 | СУБД | Библиотека | Балансировщик / Прокси | Описание |
 | :--- | :--- | :--- | :--- |
-| PostgreSQL | `jackc/pgx` | PgBouncer | Пул соединений в режиме Transaction Pooling. Запросы на чтение автоматически направляются на реплики через `pgx` с поддержкой `read-write splitting`. |
+| PostgreSQL | `pgx` | PgBouncer | Пул соединений в режиме Transaction Pooling. Запросы на чтение автоматически направляются на реплики через `pgx` с поддержкой `read-write splitting`. |
 | ScyllaDB | `gocql` | Встроенный Token-Aware Policy | Драйвер сам вычисляет узел-владелец партиции `chat_id` и отправляет запрос напрямую, минуя прокси. |
 | Redis | `go-redis` | Встроенный Cluster Client | Клиент кэширует карту слотов и направляет команды на нужный мастер без промежуточных прокси. |
-| Ceph RGW | `minio-go` | Envoy / NGINX | Для раздачи статики медиа используется NGINX reverse proxy с кэшированием. Внутренние сервисы ходят напрямую в S3 API. |
+| Ceph RGW | `minio-go` | NGINX | Для раздачи статики медиа используется NGINX reverse proxy с кэшированием. Внутренние сервисы ходят напрямую в S3 API. |
 
 ## 6.6. Схема резервного копирования
 
@@ -725,15 +691,15 @@ erDiagram
 
 | Технология | Область применения в системе Gemini | Обоснование |
 | :--- | :--- | :--- |
-| TypeScript + React | Веб-клиент (Web App) | Строгая типизация для сложной логики отображения мультимодального контента (Markdown, изображения, аудиоплеер). Виртуальный DOM React оптимален для динамического обновления потока сообщений. |
-| Kotlin / Swift | Мобильные клиенты (Android / iOS) | Нативная производительность для работы с микрофоном (ASR), камерой и локальной базой данных истории сообщений (Offline-First). |
-| Golang | Backend Core Services (API Gateway, History, Media Proxy) | Низкое потребление памяти, отличная работа с конкурентностью (горутины), что критично для поддержания миллионов долгоживущих WebSocket-соединений. |
-| Python (FastAPI / Ray) | Model Serving Wrapper / Orchestrator | Стандарт де-факто в ML-инженерии. Позволяет использовать нативные биндинги для JAX и PyTorch без накладных расходов на сериализацию в другие языки. |
-| Envoy Proxy | Service Mesh / Edge Proxy | Расширенная поддержка gRPC-Web (для стриминга ответов модели в браузер), продвинутая балансировка нагрузки и автоматический Retry/Timeout. |
-| Apache Kafka** | Шина асинхронных событий | Гарантированная доставка событий при пиковой нагрузке в 1.3M QPS. Декуплинг API запроса от тяжелой обработки (ASR, генерация эмбеддингов). |
-| Kubernetes (GKE)** | Оркестрация контейнеров | Автоматическое масштабирование (HPA) по метрикам RPS и длине очереди в Kafka. Эффективная упаковка бинов в Google Cloud. |
-| ScyllaDB** | Основное хранилище истории сообщений | Уникальная архитектура на C++ (Seastar) позволяет утилизировать 100% ресурсов NVMe дисков и 100GbE сети, обрабатывая миллионы IOPS на узел. |
-| Ceph RGW | Объектное хранилище медиафайлов | S3-совместимый API, позволяющий легко интегрироваться с CDN и мобильными SDK. Экономическая эффективность хранения эксабайт данных по сравнению с блочными томами Compute Engine. |
+| TypeScript + React | Веб-клиент (Frontend) | Статическая типизация TypeScript снижает количество ошибок в коде, а компонентная модель React с виртуальным DOM эффективно обновляет список чатов и историю переписки без перерисовки всего интерфейса |
+| Kotlin / Swift | Мобильные клиенты (Android / iOS) | Нативная разработка под Android и iOS |
+| Golang | Backend Core Services (API Gateway, History, Media Proxy) | Низкое потребление памяти, отличная работа с конкурентностью (горутины) |
+| Python (FastAPI / Ray) | Model Serving Wrapper / Orchestrator | Стандарт дв ML-инженерии. Позволяет использовать нативные биндинги для JAX и PyTorch без накладных расходов на сериализацию в другие языки. |
+| Nginx | L7-балансировка, SSL Termination | Стандарт индустрии для реверс-проксирования и распределения запросов по микросервисам |
+| Apache Kafka | Брокер сообщений | Гарантия доставки событий и сохранение порядка сообщений внутри чата через partition key |
+| Kubernetes | Оркестрация контейнеров | Автоматизация деплоя и масштабирования |
+| ScyllaDB | Основное хранилище истории сообщений | NoSQL-решение, способное выдерживать пиковую нагрузку записи/чтения|
+| Ceph RGW | Объектное хранилище медиафайлов | Распределённое объектное хранилище с S3-совместимым API (RGW) для хранения фото и видео |
 
 
 
