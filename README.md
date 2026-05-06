@@ -784,6 +784,184 @@ erDiagram
 | Grafana | Визуализация метрик для мониторинга | Стандарт для визуализации метрик |
 
 
+# 9. Обеспечение надёжности
+
+| Компонент системы | Метод обеспечения надёжности |
+|-------------------|------------------------------|
+| LVS (L4)| Резервирование Active–Passive с Keepalived. Виртуальный IP переходит на резервный узел при отказе основного. |
+| Nginx (L7) | Резервирование Active–Active (N+1). Горизонтальное масштабирование кластера реверс-прокси; автоматическое исключение узла при ошибках health-check. |
+| PostgreSQL | Master–Slave репликация. WAL-архивация с возможностью Point-in-Time Recovery. Шардирование по `user_id`, данные пользователя и его чаты локализованы на одном шарде. |
+| ScyllaDB | Распределённая архитектура с фактором репликации RF=3. Автоматическое перераспределение данных при выходе узла. Каждый чат полностью лежит на одном наборе vnodes. |
+| Redis | Redis Cluster: для каждого слота выделены мастер и минимум одна реплика в разных стойках. Автоматический failover с повышением реплики до мастера. |
+| Apache Kafka | Гарантия доставки через механизм подтверждений и хранения смещений. При падении воркера он после перезапуска продолжает чтение партиции с последнего закоммиченного смещения. |
+| Ceph RGW | Erasure Coding (8+3) позволяет восстановить данные при отказе нескольких дисков/узлов без полного дублирования. Непрерывная георепликация между региональными кластерами. |
+| Микросервисы (Kubernetes) | Автоматический перезапуск упавших подов (liveness probe). Readiness probe исключает под из трафика при обнаружении проблем. Pod anti-affinity размещает реплики в разных стойках/узлах. |
+| Общие принципы | Graceful Shutdown: при обновлении сервисы перестают принимать новые задачи, завершают обработку текущих и только затем завершают процесс.<br> Graceful Degradation: при сбое Media Service или Ceph временно недоступна работа с медиа, но текстовый диалог и история остаются полностью работоспособны. |
+
+
+# 10. Схема проекта
+
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#bbdefb', 'primaryBorderColor': '#1565c0', 'lineColor': '#1976d2', 'tertiaryColor': '#e3f2fd', 'background': 'white', 'edgeLabelBackground': '#e3f2fd' }}}%%
+flowchart TD
+    subgraph Clients["Users"]
+        Web["Web Client (React)"]
+        Mobile["Mobile Apps"]
+    end
+
+    subgraph GlobalBalancing["Global Load Balancing"]
+        GeoDNS["Geo‑DNS\n(api.*, history.*, media.*, static.*)"]
+        Anycast["Regional Anycast IP\n(BGP from all DCs in region)"]
+    end
+
+    subgraph L4["L4 Layer (per DC)"]
+        LVS["LVS (DR mode)\nKeepalived Active‑Passive"]
+    end
+
+    subgraph L7["L7 Layer"]
+        NGINX["Nginx (Reverse Proxy)\nSSL Termination, Routing\nby Domain, Static Cache"]
+    end
+
+    subgraph K8s["Kubernetes Cluster (Pods)"]
+        Auth["auth‑service\n(Go)"]
+        ApiGateway["api‑gateway\n(Go)"]
+        History["history‑service\n(Go)"]
+        MediaService["media‑service\n(Go)"]
+    end
+
+    subgraph Kafka["Apache Kafka (Brokers)"]
+        TopicMessages["topic: user‑messages"]
+        TopicMedia["topic: media‑events"]
+    end
+
+    subgraph Workers["Async Workers (K8s Pods)"]
+        InboxWorker["inbox‑worker\n(Go, writes history)"]
+        ArchiveWorker["archive‑worker\n(Python, embeddings)"]
+        MediaTranscoder["media‑transcoder\n(preview generation)"]
+    end
+
+    subgraph Model["Model Serving"]
+        GeminiModel["Gemini Model Serving\n(gRPC server‑side streaming)"]
+    end
+
+    subgraph DataStores["Data Stores"]
+        PG[("PostgreSQL\n(users, chats, media_metadata)")]
+        Scylla[("ScyllaDB\n(messages)")]
+        RedisSessions[("Redis Cluster\n(sessions)")]
+        Pgvector[("pgvector\n(embeddings)")]
+        CephRGW[("Ceph RGW\n(temp files, previews)")]
+        CDN["Cloud CDN\n(static assets)"]
+    end
+
+    Clients --> GeoDNS
+    GeoDNS -- "regional IP" --> Anycast
+    Anycast -- "TCP 443" --> LVS
+    LVS -- "DR → real server" --> NGINX
+
+    NGINX -- "static.*" --> CDN
+    NGINX -- "auth (login, register)" --> Auth
+    NGINX -- "api.* / SSE" --> ApiGateway
+    NGINX -- "history.*" --> History
+    NGINX -- "media.*" --> MediaService
+
+    Auth --> PG
+    Auth --> RedisSessions
+
+    ApiGateway -- "session check" --> RedisSessions
+    ApiGateway -- "publish message" --> Kafka
+    ApiGateway -- "gRPC stream (prompt)" --> GeminiModel
+    GeminiModel -- "gRPC stream (tokens)" --> ApiGateway
+    ApiGateway -- "SSE (tokens to client)" --> Clients
+
+    History --> PG
+    History --> Scylla
+
+    MediaService -- "upload originals" --> CephRGW
+    MediaService -- "publish event" --> Kafka
+    MediaService -- "serve previews" --> CephRGW
+
+    Kafka --> InboxWorker
+    Kafka --> ArchiveWorker
+    Kafka --> MediaTranscoder
+
+    InboxWorker -- "write message" --> Scylla
+    InboxWorker -- "update updated_at" --> PG
+
+    ArchiveWorker -- "store embeddings" --> Pgvector
+
+    MediaTranscoder -- "generate previews" --> CephRGW
+    MediaTranscoder -- "metadata" --> PG
+```
+
+
+Пояснения к схеме:
+
+Глобальная балансировка начинается с Geo DNS, возвращающего единый Anycast-адрес для каждого региона; BGP направляет пользователя в ближайший дата-центр. Внутри дата-центра LVS (L4) распределяет трафик на кластер Nginx (L7), который терминирует SSL и маршрутизирует запросы по доменам: static.* уходит в CDN, api.*/history.* — в api‑gateway и history‑service, media.* — в media‑service. Отдельный auth‑service управляет регистрацией и сессиями, сохраняя профили в PostgreSQL и токены в Redis.
+
+Api‑gateway проверяет сессию, публикует сообщение в Kafka и открывает gRPC‑стрим к Gemini Model Serving; ответ модели транслируется клиенту через SSE. History‑service читает чаты из PostgreSQL, а сообщения — из ScyllaDB. Media‑service временно сохраняет исходные файлы в Ceph RGW, генерирует превью и отправляет события в Kafka.
+
+Асинхронные воркеры обрабатывают топики Kafka: inbox‑worker записывает сообщения в ScyllaDB и обновляет дату чата в PostgreSQL; archive‑worker вычисляет эмбеддинги и кладёт их в pgvector; media‑transcoder создаёт превью и метаданные. Все stateful‑системы (PostgreSQL, ScyllaDB, Redis, Kafka, Ceph) размещены на выделенных серверах, а клиентские драйверы самостоятельно маршрутизируют запросы в нужные шарды или партиции.
+
+# 11. Список серверов
+
+Все расчёты выполнены для глобальной пиковой нагрузки (2.2): суммарный входящий трафик 100 Гбит/с, исходящий 1,13 Тбит/с, внешний RPS 11,7 тыс.  
+Самый нагруженный ДЦ (Америка, 15 %) принят за основу для детализации, остальные ДЦ масштабируются пропорционально доле трафика.  
+Распределение ДЦ и их доли: DC1 (Майами) – 15 %, DC5 (Лос-Анджелес) – 15 %, DC2 (Амстердам) – 10 %, DC6 (Франкфурт) – 10 %, DC3 (Сингапур) – 12,5 %, DC7 (Мумбаи) – 12,5 %, DC4 (Токио) – 15 %. Оставшиеся 10 % пользователей обслуживаются через ближайший ДЦ (проксирование).
+
+## 11.1 Конфигурации физических серверов (весь проект)
+
+| Название | Хостинг | Конфигурация | Ядра | Кол-во | Покупка ($) | Аренда/мес ($) |
+|----------|---------|--------------|------|--------|-------------|----------------|
+| `kubenode` | own | 2×AMD EPYC 7543 / 16×32GB / 2×NVMe 4TB / 2×25GbE | 64 | 16 | 18 000 | 300 |
+| `lvs-l4` | own | 1×Intel Xeon E-2334 / 4×8GB / 1×NVMe 512GB / 2×100GbE | 8 | 16 | 4 000 | 67 |
+| `nginx-l7` | own | 2×Intel Xeon Silver 4314 / 4×16GB / 2×NVMe 512GB / 2×100GbE | 16 | 108 | 5 500 | 92 |
+| `db-postgres` | own | 2×AMD EPYC 7282 / 8×32GB / 4×NVMe 4TB / 2×25GbE | 32 | 24 | 15 000 | 250 |
+| `db-scylla` | own | 2×AMD EPYC 7282 / 8×32GB / 8×NVMe 8TB / 2×25GbE | 32 | 21 | 22 000 | 367 |
+| `db-redis` | own | 2×Intel Xeon Silver 4210R / 16×32GB / 2×NVMe 512GB / 2×25GbE | 20 | 30 | 12 000 | 200 |
+| `kafka` | own | 2×Intel Xeon Silver 4210 / 4×32GB / 4×NVMe 4TB / 2×25GbE | 16 | 21 | 8 000 | 133 |
+| `ceph-mon` | own | 1×Intel Xeon E-2334 / 2×16GB / 2×NVMe 512GB / 2×10GbE | 8 | 9 | 4 000 | 67 |
+| `ceph-rgw` | own | 2×AMD EPYC 7282 / 4×32GB / 2×NVMe 2TB / 2×100GbE | 32 | 15 | 10 000 | 167 |
+| `ceph-osd` | own | 1×Intel Xeon E-2334 / 4×16GB / 12×HDD 18TB / 2×25GbE | 8 | 55* | 18 000 | 300 |
+
+*55 OSD-узлов — стартовая конфигурация (обеспечивает ~12 ПБ сырой ёмкости). Для полного объёма постоянного хранения через 18 месяцев (~570 ПБ данных, ~780 ПБ сырой с EC 8+3) требуется порядка 3 600 OSD-узлов; ёмкость наращивается поэтапно.
+
+## 11.2 Распределение по дата-центрам
+
+| Тип | DC1 (15%) | DC5 (15%) | DC2 (10%) | DC6 (10%) | DC3 (12.5%) | DC7 (12.5%) | DC4 (15%) | Итого |
+|-----|-----------|-----------|-----------|-----------|-------------|-------------|-----------|--------|
+| `kubenode` | 3 | 3 | 2 | 2 | 2 | 2 | 2 | 16 |
+| `lvs-l4` | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 14* |
+| `nginx-l7` | 18 | 18 | 12 | 12 | 15 | 15 | 18 | 108 |
+| `db-postgres` | 4 | 4 | 3 | 3 | 3 | 3 | 4 | 24 |
+| `db-scylla` | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 21 |
+| `db-redis` | 6 | 6 | 3 | 3 | 6 | 6 | 6 | 30** |
+| `kafka` | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 21 |
+| `ceph-osd` | | | | | | | | в составе 3 региональных кластеров: Азия (DC3,DC7,DC4) – 20; Европа (DC2,DC6) – 20; Америка (DC1,DC5) – 15. |
+| `ceph-mon` | по 3 на каждый из трёх региональных кластеров | | | | | | | 9 |
+| `ceph-rgw` | по 5 на каждый из трёх региональных кластеров | | | | | | | 15 |
+
+\* Дополнительные 2 LVS могут быть размещены в опорных точках присутствия для проксирования остальных 10 % пользователей.  
+\** Большее число Redis в крупных ДЦ связано с необходимостью держать сессии и WebSocket‑маппинг локально.
+
+## 11.3 Аллокация ресурсов микросервисов в Kubernetes (на примере DC1, 15% пиковой нагрузки)
+
+| Сервис | CPU requests | CPU limits | RAM requests | RAM limits | Реплики | Обоснование |
+|--------|--------------|------------|---------------|------------|---------|-------------|
+| `api-gateway` | 4 | 4 | 8 GB | 16 GB | 2 | 1 760 RPS; лёгкая логика + SSE-соединения |
+| `history-service` | 4 | 4 | 4 GB | 8 GB | 2 | ~576 RPS чтения истории |
+| `media-service` | 8 | 8 | 8 GB | 16 GB | 8 | 14,96 Гбит/с вх. + 169 Гбит/с исх. (сетевой предел ~25 Гбит/под) |
+| `auth-service` | 4 | 4 | 2 GB | 4 GB | 2 | пик 264 RPS логинов/регистраций |
+| `inbox-worker` | 8 | 8 | 4 GB | 8 GB | 3 | обработка Kafka-сообщений, запись в ScyllaDB |
+| `archive-worker` | 8 | 8 | 2 GB | 4 GB | 2 | генерация эмбеддингов для новых сообщений |
+| `media-transcoder` | 8 | 8 | 4 GB | 8 GB | 2 | перекодирование фото/видео в превью |
+
+- Суммарный CPU requests в DC1: 2×4 + 2×4 + 8×8 + 2×4 + 3×8 + 2×8 + 2×8 = 8 + 8 + 64 + 8 + 24 + 16 + 16 = 144 ядра.  
+- С учётом системных подов и 20% запаса: ~173 ядра.  
+- Один `kubenode` (64 ядра) вмещает 3 таких сервера (192 ядра). В DC1 запланировано 3 `kubenode` – достаточно.
+
+Для всех Go-сервисов устанавливается `GOMEMLIMIT=90%` от RAM limits, чтобы избежать OOM из-за запаздывания сборщика мусора в контейнере.
+
 
 ##  Список источников
 
