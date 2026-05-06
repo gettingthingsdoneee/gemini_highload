@@ -488,8 +488,7 @@ erDiagram
     CHATS ||--o{ MESSAGES : contains
     USERS ||--o{ MESSAGES : sends
     MESSAGES ||--o{ MEDIA : includes
-    EMBEDDINGS }o--|| MESSAGES : embeds
-    EMBEDDINGS }o--|| MEDIA : embeds
+    EMBEDDINGS }o--|| CHATS  : embeds
 ```
 
 ## 5.2 Таблица с описанием таблиц
@@ -585,8 +584,7 @@ erDiagram
     MESSAGES ||--o{ MEDIA_METADATA : includes
     MEDIA_METADATA ||--|| MEDIA_FILES : stores
     USERS ||--o{ SESSIONS : has
-    EMBEDDINGS }o--|| MESSAGES : embeds
-    EMBEDDINGS }o--|| MEDIA_METADATA : embeds
+    EMBEDDINGS }o--|| CHATS : embeds
 
 ```
 
