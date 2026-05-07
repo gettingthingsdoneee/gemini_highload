@@ -866,10 +866,10 @@ flowchart TD
     LVS -- "DR → real server" --> NGINX
 
     NGINX -- "static.*" --> CDN
-    NGINX -- "auth" --> Auth
+    ApiGateway -- "auth" --> Auth
     NGINX -- "api.* / SSE" --> ApiGateway
-    NGINX -- "history.*" --> History
-    NGINX -- "media.*" --> MediaService
+    ApiGateway -- "history.*" --> History
+    ApiGateway -- "media.*" --> MediaService
 
     Auth --> PG
     Auth --> RedisSessions
