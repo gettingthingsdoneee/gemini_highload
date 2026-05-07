@@ -904,7 +904,7 @@ flowchart TD
 
 Пояснения к схеме:
 
-Geo‑DNS возвращает единый Anycast‑IP, BGP ведёт пользователя в ближайший ДЦ. LVS распределяет трафик на Nginx, который терминирует SSL и маршрутизирует запросы по доменам: статика идёт в CDN, api.* – на api‑gateway, history.* – на history‑service, media.* – на media‑service, отдельный auth‑service управляет регистрацией и сессиями.
+Geo‑DNS возвращает единый Anycast‑IP, BGP ведёт пользователя в ближайший ДЦ. LVS распределяет трафик на Nginx, который терминирует SSL и маршрутизирует запросы по доменам: статика идёт в CDN, api. – на api‑gateway, history. – на history‑service, media. – на media‑service, отдельный auth‑service управляет регистрацией и сессиями.
 
 Api‑gateway проверяет сессию в Redis, публикует сообщение в Kafka и стримит ответ модели через SSE. Kafka служит шиной для асинхронной обработки: message‑writer сохраняет диалоги в ScyllaDB и PostgreSQL, embedding‑worker генерирует векторные представления в pgvector, asr‑worker распознаёт речь, media‑transcoder создаёт превью. Все stateful‑системы работают на выделенных серверах, stateless‑микросервисы – в Kubernetes, что обеспечивает надёжность и масштабирование.
 
