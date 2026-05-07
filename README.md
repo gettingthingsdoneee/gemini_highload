@@ -874,7 +874,6 @@ flowchart TD
     Auth --> PG
     Auth --> RedisSessions
 
-    ApiGateway -- "check session" --> RedisSessions
     ApiGateway -- "publish message" --> Kafka
     ApiGateway -- "gRPC stream (prompt)" --> GeminiModel
     GeminiModel -- "gRPC stream (tokens)" --> ApiGateway
