@@ -807,14 +807,14 @@ erDiagram
 | Микросервисы (Kubernetes) | Автоматический перезапуск упавших подов (liveness probe). Readiness probe исключает под из трафика при обнаружении проблем. Pod anti-affinity размещает реплики в разных стойках/узлах. |
 | Общие принципы | Graceful Shutdown: при обновлении сервисы перестают принимать новые задачи, завершают обработку текущих и только затем завершают процесс.<br> Graceful Degradation (ниже подробнее) |
 
-Graceful Degradation:
+**Graceful Degradation:**
 Для media-service: при отказе media-service или хранилища Ceph RGW прекращается загрузка новых вложений и отображение ранее загруженных изображений, видео и аудио. Клиент получает ошибку «Файл временно недоступен», вместо превью показывается плейсхолдер. Воркеры asr‑worker и media‑transcoder приостанавливают обработку до восстановления доступа к файлам. Продолжают работать: приём и отправка текстовых сообщений через api‑gateway, передача промптов модели по gRPC stream, стриминг ответов клиенту по SSE, получение истории чатов через history‑service, аутентификация через auth‑service и управление сессиями в Redis.
 
 Для history-service: при недоступности history‑service нельзя получить список диалогов и переключиться на ранее не открытый чат — клиент показывает ошибку «Не удалось загрузить список чатов». Текущий активный диалог, если он уже был закэширован на клиенте, продолжает обновляться в реальном времени через SSE, и новые сообщения немедленно отображаются. Сохраняют работоспособность: отправка новых сообщений через api‑gateway, передача промптов модели по gRPC stream, получение токенов через SSE, загрузка и просмотр медиа через media‑service, а также вход и проверка сессий через auth‑service и Redis. Навигация по истории остальных чатов временно недоступна, но общение в открытом диалоге не прерывается.
 
 В дополнение к ранее описанным механизмам резервирования, в системе используются два ключевых асинхронных паттерна, гарантирующих атомарность записи и доставки сообщений.
 
-Двухфазный коммит 2PC (а именно - хоровод) для записи сообщения
+**Двухфазный коммит 2PC (а именно - хоровод) для записи сообщения**
 
 Чтобы message‑writer атомарно выполнял две разнородные операции — записать сообщение в ScyllaDB и обновить updated_at чата в PostgreSQL необходим воркер, иначе при сбое между этими шагами может возникнуть неконсистентность: сообщение сохранено, но чат не обновлён, или наоборот.
 
@@ -822,7 +822,7 @@ Graceful Degradation:
 
 Фаза 2 (Commit): Если оба ответили успехом, координатор отправляет Commit — изменения фиксируются. Если хотя бы один ответил отказом (или истёк таймаут), координатор отправляет Rollback, и обе стороны откатывают изменения.
 
-Transactional Outbox для надёжной публикации событий
+**Transactional Outbox для надёжной публикации событий**
 Чтобы api‑gateway одновременно записывал данные в PostgreSQL и отправлял событие в Kafka, нужна таблица Outbox в PostgreSQL. Без Outbox между этими двумя операциями нет транзакции — если Kafka недоступен, событие теряется, а если упадёт под, событие может не отправиться.
 
 В одной ACID‑транзакции PostgreSQL api‑gateway или любой другой сервис делает запись (например, INSERT в chats) и INSERT в таблицу outbox (event_type, payload, created_at).
@@ -867,6 +867,7 @@ flowchart TD
         EmbeddingWorker["embedding‑worker<br>(Python)"]
         ASRWorker["asr‑worker<br>(Go)"]
         MediaTranscoder["media‑transcoder<br>(Python)"]
+        OutboxRelay["outbox‑relay<br>(Go sidecar)"]
     end
 
     subgraph Kafka["Apache Kafka (Brokers)"]
@@ -880,7 +881,10 @@ flowchart TD
     end
 
     subgraph DataStores["Data Stores"]
-        PG[("PostgreSQL<br>(users, chats, media_metadata,<br>outbox)")]
+        PG_Users[("PostgreSQL<br>users")]
+        PG_Chats[("PostgreSQL<br>chats")]
+        PG_MediaMeta[("PostgreSQL<br>media_metadata")]
+        PG_Outbox[("PostgreSQL<br>outbox")]
         Scylla[("ScyllaDB<br>(messages)")]
         RedisSessions[("Redis Cluster<br>(sessions)")]
         Pgvector[("pgvector<br>(embeddings)")]
@@ -888,7 +892,8 @@ flowchart TD
         CDN["Cloud CDN<br>(static assets)"]
     end
 
-    Clients --> GeoDNS
+    Web --> GeoDNS
+    Mobile --> GeoDNS
     GeoDNS -- "regional IP" --> Anycast
     Anycast -- "TCP 443" --> LVS
     LVS -- "DR → real server" --> NGINX
@@ -899,19 +904,20 @@ flowchart TD
     NGINX -- "history.*" --> History
     NGINX -- "media.*" --> MediaService
 
-    Auth --> PG
+    Auth --> PG_Users
     Auth --> RedisSessions
 
     ApiGateway -- "publish user message" --> TopicUser
     ApiGateway -- "gRPC stream (prompt)" --> GeminiModel
     GeminiModel -- "gRPC stream (tokens)" --> ApiGateway
-    ApiGateway -- "SSE (tokens to client)" --> Clients
+    ApiGateway -- "SSE (tokens to client)" --> Web
+    ApiGateway -- "SSE (tokens to client)" --> Mobile
 
-    GeminiModel --> PG
+    GeminiModel --> PG_Chats
     GeminiModel --> Scylla
     GeminiModel --> Pgvector
 
-    History --> PG
+    History --> PG_Chats
     History --> Scylla
 
     MediaService -- "upload / download" --> CephRGW
@@ -924,20 +930,19 @@ flowchart TD
     TopicOutbox --> ApiGateway
 
     MessageWriter -- "write message (2PC)" --> Scylla
-    MessageWriter -- "update updated_at (2PC)" --> PG
+    MessageWriter -- "update updated_at (2PC)" --> PG_Chats
 
     EmbeddingWorker -- "store embeddings" --> Pgvector
 
     ASRWorker -- "transcription" --> TopicUser
 
     MediaTranscoder -- "previews" --> CephRGW
-    MediaTranscoder -- "metadata" --> PG
+    MediaTranscoder -- "metadata" --> PG_MediaMeta
 
-    PG -- "outbox relay" --> TopicOutbox
+    OutboxRelay -- "read unsent" --> PG_Outbox
+    OutboxRelay -- "publish to" --> TopicOutbox
 
-    linkStyle 20,21,22,23 stroke:#f48fb1,stroke-width:3px
-    linkStyle 24,25,26,27 stroke:#f48fb1,stroke-width:3px
-    linkStyle 30,31 stroke:#f48fb1,stroke-width:3px
+    linkStyle 24,25,26,27,28,29,30,31,32,33,34,35,36 stroke:#f48fb1,stroke-width:3px
 ```
 
 Пояснения к схеме:
